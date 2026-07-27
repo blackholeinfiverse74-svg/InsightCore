@@ -1,45 +1,61 @@
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
-import jwt
-import datetime
-import os
-import uuid
-from dotenv import load_dotenv
+from fastapi import FastAPI
+from app.routes.gateway import router
+from app.security.persistence import init_db
+from app.config import settings
+from app.middleware.telemetry import TelemetryMiddleware
+from loguru import logger
+import sys
 
-load_dotenv()
+# Configure Loguru logging
+logger.remove()
+logger.add(sys.stdout, colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level:<8}</level> | {message}")
 
-app = FastAPI(title="InsightCore - Sovereign JWT Issuer")
+app = FastAPI(
+    title="InsightBridge API Gateway",
+    version="4.2",
+    description="Security-Hardened API Gateway for Sovereign Core",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
 
-JWT_SECRET = os.getenv("JWT_SECRET", "sovereign_fallback_secret")
-ALGORITHM = "HS256"
+app.add_middleware(TelemetryMiddleware)
 
-class AuthRequest(BaseModel):
-    client_id: str
-    client_secret: str
+@app.on_event("startup")
+def startup_event():
+    logger.info("Initializing InsightBridge v4.2...")
 
-@app.post("/auth/issue")
-async def issue_token(request: AuthRequest):
-    # In a real stack, validate client_secret against a DB
-    # For this sprint, we use a deterministic environment-driven secret
-    VALID_CLIENT_SECRET = os.getenv("CORE_CLIENT_SECRET", "bridge_secret_123")
-    
-    if request.client_secret != VALID_CLIENT_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid client secret")
-    
-    import time
-    now = int(time.time())
-    payload = {
-        "iss": "sovereign-core",
-        "aud": "insight-bridge",
-        "sub": request.client_id,
-        "jti": str(uuid.uuid4()),
-        "iat": now,
-        "exp": now + 3600
+    try:
+        init_db()
+        logger.info("Security Persistence Layer initialized successfully.")
+    except Exception as exc:
+        logger.critical(f"FATAL: Database initialization failed: {exc}")
+        sys.exit(1)
+
+    if settings.JWT_SECRET == "change-me":
+        logger.critical("FATAL: Default JWT_SECRET detected. Service will not start in production mode.")
+        if not settings.DEBUG:
+            sys.exit(1)
+
+    logger.info("InsightBridge is READY. Listening for ingest requests.")
+
+app.include_router(router, tags=["Gateway"])
+
+@app.get("/")
+def root():
+    return {
+        "message": "InsightBridge API is running",
+        "status": "OK",
     }
-    
-    token = jwt.encode(payload, JWT_SECRET, algorithm=ALGORITHM)
-    return {"access_token": token, "token_type": "bearer"}
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "version": "4.2",
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

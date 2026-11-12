@@ -1,0 +1,327 @@
+name: Insight Production Infrastructure CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate production deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set GitHub SHA
+        run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Generate Compose file for validation
+        run: |
+          sed "s|IMG_TAG|$short_sha|g" docker-compose.production.template.yml > docker-compose.production.yml
+
+      - name: Create stub .env files for compose validation
+        run: |
+          # Docker Compose config requires the env_files to exist to validate schema
+          mkdir -p insight-core insight-bridge insight-flow
+          touch .env insight-core/.env insight-bridge/.env insight-flow/.env
+
+      - name: Validate Docker Compose files
+        run: |
+          docker compose -f docker-compose.production.yml config
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-artifacts
+          path: |
+            docker-compose.production.template.yml
+
+  build:
+    name: Build production images
+    runs-on: ubuntu-latest
+    needs: validate
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set short git commit SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push insight-core image
+        run: |
+          docker buildx build --push \
+            --tag bhiv/insight-core:${{ steps.vars.outputs.sha_short }} \
+            --tag bhiv/insight-core:latest \
+            -f Dockerfile.core .
+
+      - name: Build and push insight-bridge image
+        run: |
+          docker buildx build --push \
+            --tag bhiv/insight-bridge:${{ steps.vars.outputs.sha_short }} \
+            --tag bhiv/insight-bridge:latest \
+            -f insight-bridge/Dockerfile insight-bridge
+
+      - name: Build and push insight-flow image
+        run: |
+          docker buildx build --push \
+            --tag bhiv/insight-flow:${{ steps.vars.outputs.sha_short }} \
+            --tag bhiv/insight-flow:latest \
+            -f insight-flow/Dockerfile insight-flow
+
+  deploy:
+    name: Deploy to remote production VM via SSH
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-artifacts
+
+      - name: Create env files from secrets
+        run: |
+          mkdir -p insight-core insight-bridge insight-flow
+          
+          # 1. InsightCore env file
+          if [ -n "${{ secrets.INSIGHT_CORE_ENV_FILE }}" ]; then
+            cat <<'EOF' > insight-core/.env
+          ${{ secrets.INSIGHT_CORE_ENV_FILE }}
+          EOF
+          else
+            cat <<'EOF' > insight-core/.env
+          JWT_SECRET=bhiv_sovereign_2026_key_!!
+          JWT_ISSUER=sovereign-core
+          JWT_AUDIENCE=insight-bridge
+          CORE_CLIENT_SECRET=bridge_secret_123
+          INGESTION_TOKEN=flow_secret_789
+          CORE_URL=http://163.128.209.18:8030
+          BRIDGE_URL=http://163.128.209.18:8029
+          FLOW_URL=http://163.128.209.18:8031/telemetry/ingest
+          HOST=0.0.0.0
+          PORT=8001
+          EOF
+          fi
+          cp insight-core/.env .env || true
+
+          # 2. InsightBridge env file
+          if [ -n "${{ secrets.INSIGHT_BRIDGE_ENV_FILE }}" ]; then
+            cat <<'EOF' > insight-bridge/.env
+          ${{ secrets.INSIGHT_BRIDGE_ENV_FILE }}
+          EOF
+          else
+            cat <<'EOF' > insight-bridge/.env
+          JWT_SECRET=bhiv_sovereign_2026_key_!!
+          JWT_ALGORITHM=HS256
+          JWT_ISSUER=sovereign-core
+          JWT_AUDIENCE=insight-bridge
+          JWT_LEEWAY=60
+          FLOW_URL=http://insight-flow:8002/telemetry/ingest
+          INGESTION_TOKEN=flow_secret_789
+          CORE_URL=http://163.128.209.18:8030
+          BRIDGE_URL=http://163.128.209.18:8029
+          REPLAY_WINDOW_SECONDS=300
+          DATABASE_URL=sqlite:///./security_persistence.db
+          LOG_LEVEL=INFO
+          DEBUG=False
+          HOST=0.0.0.0
+          PORT=8000
+          EOF
+          fi
+
+          # 3. InsightFlow env file
+          if [ -n "${{ secrets.INSIGHT_FLOW_ENV_FILE }}" ]; then
+            cat <<'EOF' > insight-flow/.env
+          ${{ secrets.INSIGHT_FLOW_ENV_FILE }}
+          EOF
+          else
+            cat <<'EOF' > insight-flow/.env
+          APP_NAME=InsightFlow
+          INGESTION_TOKEN=flow_secret_789
+          CORE_ISSUER=sovereign-core
+          CORE_AUDIENCE=insight-bridge
+          CORE_URL=http://163.128.209.18:8030
+          BRIDGE_URL=http://163.128.209.18:8029
+          INSIGHTFLOW_ENDPOINT=http://163.128.209.18:8031/telemetry/ingest
+          BUCKET_DIR=/app/bucket
+          HOST=0.0.0.0
+          PORT=8002
+          DEBUG=False
+          EOF
+          fi
+
+      - name: Tar deployment files
+        run: |
+          tar -czf deployment.tar.gz docker-compose.production.template.yml .env insight-core/.env insight-bridge/.env insight-flow/.env
+
+      - name: Install sshpass
+        run: |
+          sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Create INSIGHTCORE directory on VM
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh -p ${{ secrets.VM_PORT }} -o StrictHostKeyChecking=no ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "mkdir -p ~/INSIGHTCORE"
+
+      - name: Copy deployment tarball to VM
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" scp -P ${{ secrets.VM_PORT }} -o StrictHostKeyChecking=no deployment.tar.gz ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }}:~/INSIGHTCORE/deployment.tar.gz
+
+      - name: Deploy production stack on VM
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh -p ${{ secrets.VM_PORT }} -o StrictHostKeyChecking=no ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "bash -s" << 'EOF'
+            set -euo pipefail
+            cd ~/INSIGHTCORE
+            
+            # Clean directory first, keeping docs folder and the deployment archive
+            find . -mindepth 1 ! -name docs ! -path './docs/*' ! -name deployment.tar.gz -exec rm -rf {} +
+            
+            # Extract deployment archive and clean up tarball
+            tar -xzf deployment.tar.gz
+            rm -f deployment.tar.gz
+            
+            # Confirm Docker & Docker Compose availability
+            docker version
+            docker compose version
+            
+            # Log in to Docker Hub on the VM for private image pulls
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+            
+            # Restore persistent Release History
+            mkdir -p docs
+            if [ -f /var/tmp/INSIGHTCORE/RELEASE_HISTORY.md ]; then
+              cp /var/tmp/INSIGHTCORE/RELEASE_HISTORY.md docs/RELEASE_HISTORY.md
+            fi
+            
+            # Generate target compose file from template by substituting the image tag
+            sed "s|IMG_TAG|${{ needs.build.outputs.sha_short }}|g" docker-compose.production.template.yml > docker-compose.production.yml
+            
+            # Validate compose config before deployment
+            docker compose -f docker-compose.production.yml config
+            
+            # Pull new production images
+            docker compose -f docker-compose.production.yml pull
+            
+            # Log out from Docker Hub to secure credentials on the VM
+            docker logout
+            
+            # Deploy production containers
+            docker compose -f docker-compose.production.yml up -d --remove-orphans
+            
+            # Verify container status
+            docker compose -f docker-compose.production.yml ps
+            
+            # Health Check - Check docker health status and host port endpoints (8029, 8030, 8031)
+            echo "Waiting for services to become healthy..."
+            for i in {1..12}; do
+              if docker compose -f docker-compose.production.yml ps --filter "status=running" --filter "health=unhealthy" -q >/dev/null 2>&1; then
+                UNHEALTHY_COUNT=$(docker compose -f docker-compose.production.yml ps --filter "status=running" --filter "health=unhealthy" -q | wc -l)
+                STARTING_COUNT=$(docker compose -f docker-compose.production.yml ps --filter "status=running" --filter "health=starting" -q | wc -l)
+              else
+                UNHEALTHY_COUNT=0
+                STARTING_COUNT=0
+              fi
+              
+              # Service Health Checks via docker inspect
+              FLOW_HEALTH=0
+              FLOW_STATUS=$(docker inspect --format='{{.State.Health.Status}}' insight_flow 2>/dev/null || echo "missing")
+              [ "$FLOW_STATUS" = "healthy" ] && FLOW_HEALTH=1
+              
+              CORE_HEALTH=0
+              CORE_STATUS=$(docker inspect --format='{{.State.Health.Status}}' insight_core 2>/dev/null || echo "missing")
+              [ "$CORE_STATUS" = "healthy" ] && CORE_HEALTH=1
+              
+              BRIDGE_HEALTH=0
+              BRIDGE_STATUS=$(docker inspect --format='{{.State.Health.Status}}' insight_bridge 2>/dev/null || echo "missing")
+              [ "$BRIDGE_STATUS" = "healthy" ] && BRIDGE_HEALTH=1
+              
+              # Host Port checks (Host 8029 -> Bridge 8000, Host 8030 -> Core 8001, Host 8031 -> Flow 8002)
+              HOST_PORTS_OK=0
+              if curl -sf http://localhost:8029/openapi.json >/dev/null && \
+                 curl -sf http://localhost:8030/openapi.json >/dev/null && \
+                 curl -sf http://localhost:8031/openapi.json >/dev/null; then
+                HOST_PORTS_OK=1
+              fi
+              
+              if [ "$UNHEALTHY_COUNT" -eq 0 ] && [ "$STARTING_COUNT" -eq 0 ] && [ "$FLOW_HEALTH" -eq 1 ] && [ "$CORE_HEALTH" -eq 1 ] && [ "$BRIDGE_HEALTH" -eq 1 ] && [ "$HOST_PORTS_OK" -eq 1 ]; then
+                echo "All containers (Flow: 8031, Core: 8030, Bridge: 8029) are verified healthy and responding!"
+                break
+              fi
+              
+              if [ "$i" -eq 12 ]; then
+                echo "Health check timeout failed!"
+                docker compose -f docker-compose.production.yml ps
+                docker compose -f docker-compose.production.yml logs --tail=50
+                exit 1
+              fi
+              
+              echo "Status: $STARTING_COUNT starting, $UNHEALTHY_COUNT unhealthy, flow=$FLOW_HEALTH, core=$CORE_HEALTH, bridge=$BRIDGE_HEALTH, host_ports=$HOST_PORTS_OK. Retrying in 10s..."
+              sleep 10
+            done
+            
+            # Prune old images while preserving recently built ones (last 7 days / 168 hours)
+            docker image prune -af --filter "until=168h"
+          EOF
+
+      - name: Update Release Documentation on Success
+        if: success()
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh -p ${{ secrets.VM_PORT }} -o StrictHostKeyChecking=no ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "bash -s" << 'EOF'
+            set -euo pipefail
+            cd ~/INSIGHTCORE
+            if [ ! -f docs/RELEASE_HISTORY.md ]; then
+              mkdir -p docs
+              echo "# Release History and Deployment Registry" > docs/RELEASE_HISTORY.md
+              echo "" >> docs/RELEASE_HISTORY.md
+              echo "| Timestamp | Image Tag (Git SHA) | Status | Description |" >> docs/RELEASE_HISTORY.md
+              echo "|---|---|---|---|" >> docs/RELEASE_HISTORY.md
+            fi
+            echo "| $(date -u +'%Y-%m-%d %H:%M:%S UTC') | ${{ needs.build.outputs.sha_short }} | SUCCESS | Insight Stack deployment on ports 8029, 8030, 8031 |" >> docs/RELEASE_HISTORY.md
+          EOF
+
+      - name: Save persistent Release History
+        if: always()
+        run: |
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh -p ${{ secrets.VM_PORT }} -o StrictHostKeyChecking=no ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "bash -s" << 'EOF'
+            set -euo pipefail
+            cd ~/INSIGHTCORE
+            if [ -f docs/RELEASE_HISTORY.md ]; then
+              mkdir -p /var/tmp/INSIGHTCORE
+              cp docs/RELEASE_HISTORY.md /var/tmp/INSIGHTCORE/RELEASE_HISTORY.md
+            fi
+          EOF
+
+  rollback:
+    name: Rollback on deployment failure
+    needs: [build, deploy]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Diagnostics & Log Dump on VM
+        run: |
+          sudo apt-get update && sudo apt-get install -y sshpass
+          sshpass -p "${{ secrets.VM_PASSWORD }}" ssh -p ${{ secrets.VM_PORT }} -o StrictHostKeyChecking=no ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "bash -s" << 'EOF'
+            cd ~/INSIGHTCORE || exit 0
+            echo "=== Deployment Failed: Diagnostic Container Logs ==="
+            docker compose -f docker-compose.production.yml ps || true
+            docker compose -f docker-compose.production.yml logs --tail=100 || true
+            
+            # Record failed release in history
+            mkdir -p docs
+            echo "| $(date -u +'%Y-%m-%d %H:%M:%S UTC') | ${{ needs.build.outputs.sha_short }} | FAILED | Deployment failed health check |" >> docs/RELEASE_HISTORY.md
+            if [ -d /var/tmp/INSIGHTCORE ]; then
+              cp docs/RELEASE_HISTORY.md /var/tmp/INSIGHTCORE/RELEASE_HISTORY.md || true
+            fi
+          EOF

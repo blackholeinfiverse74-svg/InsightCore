@@ -1,0 +1,14 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.mp4
+*.png
+.env
+.env.*
+!.env.example
+deployment.tar.gz
+

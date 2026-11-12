@@ -1,0 +1,101 @@
+services:
+  # ==============================================================================
+  # InsightFlow: Telemetry Ingestion Surface
+  # VM Host Port: 8031 mapped to Container Port: 8002
+  # Implementation: InsightCore/insight-flow/main.py
+  # Storage Target: InsightCore/bucket/
+  # Env File: insight-flow/.env
+  # ==============================================================================
+  insight-flow:
+    image: bhiv/insight-flow:IMG_TAG
+    container_name: insight_flow
+    restart: unless-stopped
+    ports:
+      - "8031:8002"
+    env_file:
+      - ./insight-flow/.env
+    volumes:
+      - insight_bucket_data:/app/bucket
+      - insight_bucket_data:/bucket
+    networks:
+      - insight_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/openapi.json"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==============================================================================
+  # InsightCore: Sovereign JWT Issuer
+  # VM Host Port: 8030 mapped to Container Port: 8001
+  # Implementation: InsightCore/main.py
+  # Env File: insight-core/.env
+  # ==============================================================================
+  insight-core:
+    image: bhiv/insight-core:IMG_TAG
+    container_name: insight_core
+    restart: unless-stopped
+    ports:
+      - "8030:8001"
+    env_file:
+      - ./insight-core/.env
+    networks:
+      - insight_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/openapi.json"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==============================================================================
+  # InsightBridge: Security Boundary Enforcement
+  # VM Host Port: 8029 mapped to Container Port: 8000
+  # Implementation: InsightCore/insight-bridge/main.py
+  # Env File: insight-bridge/.env
+  # ==============================================================================
+  insight-bridge:
+    image: bhiv/insight-bridge:IMG_TAG
+    container_name: insight_bridge
+    restart: unless-stopped
+    ports:
+      - "8029:8000"
+    env_file:
+      - ./insight-bridge/.env
+    networks:
+      - insight_network
+    depends_on:
+      insight-flow:
+        condition: service_healthy
+      insight-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/openapi.json"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  insight_network:
+    driver: bridge
+
+volumes:
+  insight_bucket_data:
+    driver: local
